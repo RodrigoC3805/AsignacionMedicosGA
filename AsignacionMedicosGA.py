@@ -5,7 +5,7 @@ import random
 import statistics
 import threading
 import urllib.parse
-import webbrowser
+import os
 from dataclasses import dataclass, asdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, List, Optional, Tuple
@@ -1096,21 +1096,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    port=8765
-    server=HTTPServer(("localhost",port),Handler)
-    url=f"http://localhost:{port}"
+    port = int(os.environ.get("PORT", 8765))
+    server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"\n{'='*62}")
     print(f"  AG SERUMS — Asignación de Médicos Rurales · MINSA")
     print(f"  Grupo 6 · Sistemas Inteligentes 2026-I · UNMSM")
     print(f"{'='*62}")
-    print(f"  URL : {url}")
+    print(f"  Puerto : {port}")
     print(f"  Instancia : N=30, M=8, B=S/50 000")
     print(f"  Preferencias: sobre ESTABLECIMIENTOS (IDs 1-8)")
-    print(f"  Ctrl+C para detener.")
     print(f"{'='*62}\n")
-    threading.Timer(0.8,lambda:webbrowser.open(url)).start()
-    try:server.serve_forever()
-    except KeyboardInterrupt:print("\n  Servidor detenido.");server.shutdown()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Servidor detenido.")
+        server.shutdown()
 
 if __name__=="__main__":
     main()
