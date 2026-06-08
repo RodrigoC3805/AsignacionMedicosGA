@@ -43,7 +43,7 @@ class FitnessBreakdown:
 
 
 # ============================================================
-# INSTANCIA FIJA DEL DOCUMENTO — Tabla 2 (sin columna de región)
+# INSTANCIA FIJA DEL DOCUMENTO
 # ============================================================
 
 DOCUMENT_ESTABLISHMENTS = [
@@ -83,10 +83,6 @@ CORRIDA_CONFIGS = {
 
 
 def generate_document_instance() -> Tuple[List[Doctor], List[Establishment], int]:
-    """
-    Genera la instancia del informe con semilla 42.
-    Cada médico tiene 3 establecimientos preferidos elegidos al azar entre IDs 1-8.
-    """
     rng = random.Random(DOCUMENT_SEED)
     est_ids = [e.id for e in DOCUMENT_ESTABLISHMENTS]
     doctors = [
@@ -129,16 +125,11 @@ class MedicalAssignmentGA:
         self.rng            = random.Random(config.seed)
         self.N              = len(doctors)
         self.M              = len(establishments)
-
-        # establishment_id -> índice 0-based en la lista
         self.est_id_to_idx: Dict[int, int] = {e.id: i for i, e in enumerate(establishments)}
-
-        # Para cada médico: lista de índices 0-based de sus establecimientos preferidos
         self.pref_indices: List[List[int]] = [
             [self.est_id_to_idx[eid] for eid in d.preferences]
             for d in doctors
         ]
-
         self.score_matrix   = self._build_scores()
         self.population: List[List[int]] = []
         self.best_chromosome = None
@@ -149,11 +140,6 @@ class MedicalAssignmentGA:
         self.running        = False
 
     def _build_scores(self):
-        """
-        Matriz satisfacción N x M.
-        s[médico][est_idx] = 30 (1ª pref), 20 (2ª), 10 (3ª), 0 (no preferido).
-        Preferencias son sobre establecimientos, no regiones (§3.1).
-        """
         m = [[0]*self.M for _ in range(self.N)]
         for di, d in enumerate(self.doctors):
             for rank, eid in enumerate(d.preferences):
@@ -164,7 +150,6 @@ class MedicalAssignmentGA:
         return self.rng.randrange(self.M)
 
     def init_pop(self):
-        """§6: 20% semi-heurístico (1ª pref establecimiento), 80% aleatorio."""
         pop  = [[self.rg() for _ in range(self.N)] for _ in range(self.config.population_size)]
         semi = max(1, int(self.config.population_size * self.config.semi_heuristic_ratio))
         for i in range(semi):
@@ -209,14 +194,12 @@ class MedicalAssignmentGA:
     def mutate(self, ch):
         if self.rng.random() < self.config.mutation_rate:
             i = self.rng.randrange(self.N)
-            # Mejora 5: guía la mutación hacia un establecimiento preferido del médico
             if self.config.guided_mutation and self.rng.random() < self.config.guided_mutation_prob:
                 ch[i] = self.rng.choice(self.pref_indices[i])
             else:
                 ch[i] = self.rg()
 
     def repair(self, ch):
-        """Mejora 6: reubica excedentes en centros con vacantes (pref. establecimientos preferidos)."""
         if not self.config.repair_enabled or self.rng.random() > self.config.repair_prob:
             return
         cnt = [0]*self.M
@@ -261,7 +244,6 @@ class MedicalAssignmentGA:
         return self.best_chromosome, self.best_breakdown
 
     def decode(self, ch):
-        """Decodifica cromosoma. Muestra establecimientos preferidos (no regiones)."""
         out = []
         for di, ei in enumerate(ch):
             d, e = self.doctors[di], self.establishments[ei]
@@ -269,8 +251,8 @@ class MedicalAssignmentGA:
             out.append({
                 "doctor_id":                     d.id,
                 "doctor_name":                   d.name,
-                "preferred_establishments":      d.preferences,      # IDs [3, 1, 7]
-                "preferred_establishment_names": pref_names,         # nombres legibles
+                "preferred_establishments":      d.preferences,
+                "preferred_establishment_names": pref_names,
                 "assigned_establishment_id":     e.id,
                 "assigned_establishment_name":   e.name,
                 "assigned_risk_level":           e.risk_level,
@@ -322,73 +304,53 @@ class AppState:
     def __init__(self):
         self.lock = threading.Lock()
         self.doctors, self.establishments, self.budget = generate_document_instance()
-        self.free_ga: Optional[MedicalAssignmentGA] = None
-        self.free_optimizing = False
-        self.free_breakdown: Optional[FitnessBreakdown] = None
-        self.free_decoded: List[Dict] = []
-        self.free_config_label = ""
+        self.current_selected_corrida = 0
         self.corridas: Dict[int, CorridaState] = {
             n: CorridaState(n, CORRIDA_CONFIGS[n]["label"]) for n in range(1, 5)
         }
         self.corridas_running = False
-        self.status_message = "Instancia Tabla 2 cargada (N=30, M=8, B=S/50 000). Lista."
-        self.status_type    = "success"
+        self.has_run_once = False
+        self.current_seed = DOCUMENT_SEED          # semilla activa
+        self.best_corrida_num: Optional[int] = None  # corrida ganadora del último batch
+        self.run_count = 0                          # cuántos batches se han ejecutado
+        self.status_message = "Instancia cargada (N=30, M=8, B=S/50 000). Presiona 'Ejecutar las 4 corridas' para comenzar."
+        self.status_type    = "info"
 
     def _make_config(self, crossover_type="single_point",
-                     guided_mutation=False, repair_enabled=False) -> GAConfig:
-        return GAConfig(**FIXED_GA_PARAMS, seed=DOCUMENT_SEED,
+                     guided_mutation=False, repair_enabled=False,
+                     seed=DOCUMENT_SEED) -> GAConfig:
+        return GAConfig(**FIXED_GA_PARAMS, seed=seed,
                         crossover_type=crossover_type,
                         guided_mutation=guided_mutation,
                         repair_enabled=repair_enabled)
 
-    def run_free(self, corrida_num: int):
-        if self.free_optimizing: return
-        cc  = CORRIDA_CONFIGS[corrida_num]
-        cfg = self._make_config(cc["crossover_type"], cc["guided_mutation"], cc["repair_enabled"])
-        with self.lock:
-            self.free_optimizing   = True
-            self.free_breakdown    = None
-            self.free_decoded      = []
-            self.free_config_label = cc["label"]
-            docs, ests, bud        = generate_document_instance()
-            self.free_ga           = MedicalAssignmentGA(docs, ests, bud, cfg)
-            self.status_message    = f"Ejecutando corrida: {cc['label']}…"
-            self.status_type       = "running"
-
-        def job():
-            try:
-                ch, bd = self.free_ga.evolve()
-                with self.lock:
-                    self.free_breakdown = bd
-                    self.free_decoded   = self.free_ga.decode(ch)
-                    self.status_message = (f"[{cc['label']}] Listo en "
-                                           f"{self.free_ga.current_gen} gen. "
-                                           f"Fitness: {bd.fitness:.0f}")
-                    self.status_type    = "success"
-            except Exception as e:
-                with self.lock:
-                    self.status_message = f"Error: {e}"
-                    self.status_type    = "error"
-            finally:
-                with self.lock:
-                    self.free_optimizing = False
-
-        threading.Thread(target=job, daemon=True).start()
-
-    def run_all_corridas(self):
+    def run_all_corridas(self, use_random_seed=False):
         if self.corridas_running: return
+        seed = random.randint(0, 999999) if use_random_seed else DOCUMENT_SEED
         with self.lock:
             self.corridas_running = True
+            self.has_run_once = True
+            self.current_seed = seed
+            self.best_corrida_num = None
+            self.run_count += 1
             for n in range(1, 5):
                 self.corridas[n] = CorridaState(n, CORRIDA_CONFIGS[n]["label"], status="running")
-            self.status_message = "Ejecutando 4 corridas en paralelo…"
+            seed_label = f"semilla aleatoria {seed}" if use_random_seed else f"semilla fija {seed}"
+            self.status_message = f"Ejecutando 4 corridas en paralelo… ({seed_label})"
             self.status_type    = "running"
 
         threads = []
         for n in range(1, 5):
             cc  = CORRIDA_CONFIGS[n]
-            cfg = self._make_config(cc["crossover_type"], cc["guided_mutation"], cc["repair_enabled"])
+            cfg = self._make_config(cc["crossover_type"], cc["guided_mutation"],
+                                    cc["repair_enabled"], seed=seed)
             docs, ests, bud = generate_document_instance()
+            # Regenerate doctors with current seed so preferences vary on random runs
+            rng_inst = random.Random(seed)
+            est_ids = [e.id for e in DOCUMENT_ESTABLISHMENTS]
+            docs = [Doctor(id=i, name=f"Médico {i}",
+                           preferences=rng_inst.sample(est_ids, 3))
+                    for i in range(1, DOCUMENT_N + 1)]
             ga  = MedicalAssignmentGA(docs, ests, bud, cfg)
             with self.lock:
                 self.corridas[n].ga = ga
@@ -409,7 +371,14 @@ class AppState:
                     with self.lock:
                         if all(self.corridas[k].status in ("done", "error") for k in range(1, 5)):
                             self.corridas_running = False
-                            self.status_message   = "Las 4 corridas finalizaron."
+                            done = [n for n in range(1, 5) if self.corridas[n].breakdown]
+                            if done:
+                                best_n = max(done, key=lambda n: self.corridas[n].breakdown.fitness)
+                                self.current_selected_corrida = best_n
+                                self.best_corrida_num = best_n
+                            seed_used = self.current_seed
+                            seed_label = f"semilla aleatoria {seed_used}" if use_random_seed else f"semilla fija {seed_used}"
+                            self.status_message = f"Las 4 corridas finalizaron · {seed_label} · batch #{self.run_count}"
                             self.status_type      = "success"
 
             t = threading.Thread(target=job, daemon=True)
@@ -420,37 +389,61 @@ class AppState:
         with self.lock:
             self.corridas = {n: CorridaState(n, CORRIDA_CONFIGS[n]["label"]) for n in range(1, 5)}
             self.corridas_running = False
+            self.has_run_once = False
+            self.current_selected_corrida = 0
+            self.best_corrida_num = None
+            self.run_count = 0
+            self.current_seed = DOCUMENT_SEED
+            self.status_message = "Reiniciado. Presiona 'Ejecutar las 4 corridas' para comenzar."
+            self.status_type = "info"
+
+    def select_corrida(self, corrida_num: int):
+        with self.lock:
+            if 1 <= corrida_num <= 4:
+                self.current_selected_corrida = corrida_num
 
     def get_state(self):
         with self.lock:
-            free_gp = {}
-            if self.free_ga:
-                free_gp = {"current_gen": self.free_ga.current_gen,
-                            "history_best": self.free_ga.history_best[-300:],
-                            "history_mean": self.free_ga.history_mean[-300:]}
             free_bd = None
-            if self.free_breakdown:
-                b = self.free_breakdown
-                free_bd = {"fitness": b.fitness, "satisfaction_total": b.satisfaction_total,
-                           "penalty_capacity": b.penalty_capacity,
-                           "penalty_epidemiological": b.penalty_epidemiological,
-                           "penalty_budget": b.penalty_budget, "total_cost": b.total_cost,
-                           "budget_excess": b.budget_excess,
-                           "assigned_per_establishment": {str(k): v for k, v in b.assigned_per_establishment.items()}}
+            free_decoded = []
+            best_info = None
+            sel = self.current_selected_corrida
+            if 1 <= sel <= 4:
+                c = self.corridas[sel]
+                if c.breakdown:
+                    b = c.breakdown
+                    free_bd = {"fitness": b.fitness, "satisfaction_total": b.satisfaction_total,
+                               "penalty_capacity": b.penalty_capacity,
+                               "penalty_epidemiological": b.penalty_epidemiological,
+                               "penalty_budget": b.penalty_budget, "total_cost": b.total_cost,
+                               "budget_excess": b.budget_excess,
+                               "assigned_per_establishment": {str(k): v for k, v in b.assigned_per_establishment.items()}}
+                    free_decoded = c.decoded or []
+                    cc = CORRIDA_CONFIGS[sel]
+                    best_info = {
+                        "corrida_num":    sel,
+                        "label":          c.label,
+                        "crossover_type": cc["crossover_type"],
+                        "guided_mutation": cc["guided_mutation"],
+                        "repair_enabled": cc["repair_enabled"],
+                        "seed":           self.current_seed,
+                        "is_best":        sel == self.best_corrida_num,
+                        "run_count":      self.run_count,
+                    }
             return {
                 "n_doctors":         len(self.doctors),
                 "n_establishments":  len(self.establishments),
                 "budget":            self.budget,
-                "seed":              DOCUMENT_SEED,
-                "free_optimizing":   self.free_optimizing,
-                "free_config_label": self.free_config_label,
+                "seed":              self.current_seed,
                 "corridas_running":  self.corridas_running,
+                "has_run_once":      self.has_run_once,
+                "run_count":         self.run_count,
                 "status_message":    self.status_message,
                 "status_type":       self.status_type,
                 "establishments":    [asdict(e) for e in self.establishments],
                 "free_breakdown":    free_bd,
-                "free_decoded":      self.free_decoded,
-                "free_ga_progress":  free_gp,
+                "free_decoded":      free_decoded,
+                "best_info":         best_info,
                 "fixed_params":      FIXED_GA_PARAMS,
                 "corridas":          {str(n): self.corridas[n].to_dict() for n in range(1, 5)},
             }
@@ -499,8 +492,7 @@ body{min-height:100vh}
 .sdot.success{background:var(--ok)}.sdot.running{background:var(--warn);animation:pulse 1s infinite}
 .sdot.error{background:var(--err)}.sdot.info{background:var(--acc)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.body{display:grid;grid-template-columns:260px 1fr;height:calc(100vh - 88px);overflow:hidden}
-.sidebar{overflow-y:auto;padding:14px 12px;border-right:1px solid var(--brd);background:var(--surf);display:flex;flex-direction:column;gap:10px}
+.body{display:grid;grid-template-columns:1fr;height:calc(100vh - 88px);overflow:hidden}
 .content{overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
 .btn{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-family:var(--font);font-size:12px;font-weight:600;transition:all .14s;white-space:nowrap}
 .btn:disabled{opacity:.35;cursor:not-allowed}
@@ -508,26 +500,6 @@ body{min-height:100vh}
 .btn-ok:hover:not(:disabled){filter:brightness(1.1);transform:translateY(-1px)}
 .btn-ghost{background:var(--surf3);color:var(--txt2);border:1px solid var(--brd2)}
 .btn-ghost:hover:not(:disabled){color:var(--txt);border-color:var(--acc)}
-.sec-lbl{font-size:9px;font-weight:700;color:var(--txt3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;padding-left:2px}
-.mg{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.met{background:var(--surf3);border:1px solid var(--brd);border-radius:8px;padding:8px 10px}
-.met.full{grid-column:1/-1}
-.ml{font-size:9px;color:var(--txt3);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
-.mv{font-size:18px;font-weight:700;font-family:var(--mono);letter-spacing:-.5px}
-.ca{color:var(--acc)}.cc{color:var(--acc2)}.co{color:var(--ok)}.cw{color:var(--warn)}.ce{color:var(--err)}.cp{color:var(--acc3)}
-.params-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
-.param-box{background:var(--surf3);border:1px solid var(--brd);border-radius:7px;padding:7px 9px}
-.param-box.full{grid-column:1/-1}
-.pl{font-size:9px;color:var(--txt3);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
-.pv{font-size:13px;font-weight:700;font-family:var(--mono);color:var(--acc2)}
-.param-note{font-size:9px;color:var(--txt3);margin-top:1px}
-.corrida-btns{display:flex;flex-direction:column;gap:5px}
-.cbtn{display:flex;align-items:center;gap:8px;padding:8px 11px;background:var(--surf3);border:1px solid var(--brd);border-radius:8px;cursor:pointer;font-family:var(--font);font-size:11px;font-weight:500;color:var(--txt2);transition:all .14s;text-align:left}
-.cbtn:hover:not(:disabled){border-color:var(--acc);color:var(--txt)}
-.cbtn:disabled{opacity:.4;cursor:not-allowed}
-.cbtn .num{width:20px;height:20px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0}
-.cn1{background:rgba(59,127,255,.2);color:var(--c1)}.cn2{background:rgba(245,166,35,.2);color:var(--c2)}
-.cn3{background:rgba(31,216,164,.2);color:var(--c3)}.cn4{background:rgba(176,126,248,.2);color:var(--c4)}
 .tabs{display:flex;gap:2px;padding:3px;background:var(--surf);border-radius:7px;flex-wrap:wrap}
 .tab{padding:5px 12px;border-radius:5px;border:none;background:none;color:var(--txt3);font-family:var(--font);font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
 .tab.active{background:var(--surf3);color:var(--txt);border:1px solid var(--brd2)}
@@ -603,22 +575,12 @@ tbody td{padding:7px 10px;vertical-align:middle}
 .cmp-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--txt2);margin-bottom:8px}
 .cmp-legend-item{display:flex;align-items:center;gap:5px}
 .cleg-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
-.mejoras-table{width:100%;border-collapse:collapse;font-size:11px}
-.mejoras-table th{background:var(--surf3);padding:7px 10px;text-align:left;font-size:9px;font-weight:700;color:var(--txt3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--brd2)}
-.mejoras-table td{padding:8px 10px;border-bottom:1px solid var(--brd);vertical-align:top;line-height:1.5}
-.mejoras-table tr:last-child td{border-bottom:none}
-.m-num{font-family:var(--mono);font-weight:700;color:var(--acc);width:30px}
-.m-name{font-weight:600;color:var(--txt)}
-.m-benefit{color:var(--txt2)}
 .overlay{position:fixed;inset:0;background:rgba(6,10,18,.85);backdrop-filter:blur(8px);z-index:200;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .22s}
 .overlay.on{opacity:1;pointer-events:all}
 .ov-box{background:var(--surf2);border:1px solid var(--brd2);border-radius:14px;padding:28px 36px;text-align:center;max-width:380px}
 .spin{width:44px;height:44px;border:3px solid var(--brd2);border-top-color:var(--acc);border-radius:50%;animation:spin .7s linear infinite;margin:0 auto 14px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.ov-gen{font-family:var(--mono);font-size:11px;color:var(--acc2);margin-top:7px}
-.ov-prog{background:var(--brd);border-radius:2px;height:2px;margin-top:8px;overflow:hidden}
-.ov-bar{height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:2px;transition:width .5s}
-/* Pref tags: distinguen 1ª/2ª/3ª preferencia de ESTABLECIMIENTO */
+/* Pref tags */
 .pt{font-size:9px;padding:2px 6px;border-radius:3px;background:var(--surf);border:1px solid var(--brd);color:var(--txt3);white-space:nowrap;display:inline-block}
 .pt.p1{border-color:var(--ok);color:var(--ok)}
 .pt.p2{border-color:var(--warn);color:var(--warn)}
@@ -628,7 +590,22 @@ tbody td{padding:7px 10px;vertical-align:middle}
 .fact-text{font-size:10px;line-height:1.5}
 .fact-lbl{color:var(--txt3);font-size:9px}
 .fact-val{font-family:var(--mono);font-weight:600;color:var(--ok)}
-.info-note{background:rgba(59,127,255,.07);border:1px solid rgba(59,127,255,.25);border-left:3px solid var(--acc);border-radius:8px;padding:10px 14px;font-size:11px;color:var(--txt2);line-height:1.7;margin-bottom:12px}
+/* Pantalla de bienvenida */
+.welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;text-align:center;gap:20px}
+.welcome-icon{font-size:56px;opacity:.7}
+.welcome-title{font-size:22px;font-weight:700;color:var(--txt)}
+.welcome-sub{font-size:13px;color:var(--txt2);line-height:1.7;max-width:520px}
+.welcome-btn{padding:12px 28px;font-size:14px;border-radius:8px;background:linear-gradient(135deg,#0fa870,#1fd8a4);color:#fff;border:none;cursor:pointer;font-family:var(--font);font-weight:700;transition:all .16s;display:inline-flex;align-items:center;gap:8px}
+.welcome-btn:hover{filter:brightness(1.12);transform:translateY(-2px);box-shadow:0 8px 24px rgba(31,216,164,.25)}
+.welcome-chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+.welcome-chip{background:var(--surf3);border:1px solid var(--brd2);border-radius:20px;padding:4px 14px;font-size:11px;color:var(--txt2);font-family:var(--mono)}
+/* Banner de corrida ganadora */
+.best-banner{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 14px;border-radius:8px;border:1px solid rgba(31,216,164,.3);background:rgba(31,216,164,.06);font-size:11px;color:var(--txt2);line-height:1.6}
+.best-banner .bb-icon{font-size:15px;flex-shrink:0}
+.best-banner .bb-title{font-weight:700;color:var(--ok);margin-right:4px}
+.best-banner .bb-tag{display:inline-flex;align-items:center;gap:3px;padding:1px 8px;border-radius:20px;font-size:9px;font-weight:700;background:rgba(0,212,200,.1);border:1px solid rgba(0,212,200,.25);color:var(--acc2);font-family:var(--mono);white-space:nowrap}
+.best-banner .bb-tag.rnd{background:rgba(176,126,248,.1);border-color:rgba(176,126,248,.3);color:var(--acc3)}
+.rc-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border-radius:20px;font-size:10px;font-weight:700;background:rgba(59,127,255,.1);border:1px solid rgba(59,127,255,.25);color:var(--acc);font-family:var(--mono)}
 </style>
 </head>
 <body>
@@ -657,224 +634,149 @@ tbody td{padding:7px 10px;vertical-align:middle}
 </header>
 
 <div class="body">
-<aside class="sidebar">
-  <div class="sec-lbl">Instancia (Tabla 2)</div>
-  <div class="mg">
-    <div class="met"><div class="ml">Médicos</div><div class="mv ca">30</div></div>
-    <div class="met"><div class="ml">Centros</div><div class="mv cc">8</div></div>
-    <div class="met full"><div class="ml">Presupuesto MINSA</div><div class="mv cw" style="font-size:15px">S/ 50 000</div></div>
-    <div class="met"><div class="ml">Cap. total</div><div class="mv co">38</div><div style="font-size:9px;color:var(--txt3);margin-top:1px">plazas</div></div>
-    <div class="met"><div class="ml">Cuota mín.</div><div class="mv ce">19</div><div style="font-size:9px;color:var(--txt3);margin-top:1px">obligatorias</div></div>
-    <div class="met full"><div class="ml">K<sub>mín</sub> factible</div><div class="mv" style="font-size:14px;color:var(--ok)">S/ 48 000</div><div style="font-size:9px;color:var(--txt3);margin-top:1px">margen S/ 2 000 (4 %)</div></div>
-  </div>
-
-  <div class="sec-lbl" style="margin-top:4px">Parámetros del AG (fijos)</div>
-  <div class="params-grid">
-    <div class="param-box"><div class="pl">Población</div><div class="pv">100</div></div>
-    <div class="param-box"><div class="pl">Max gen.</div><div class="pv">500</div></div>
-    <div class="param-box"><div class="pl">P. cruce</div><div class="pv">0.80</div></div>
-    <div class="param-box"><div class="pl">P. mutación</div><div class="pv">0.05</div></div>
-    <div class="param-box"><div class="pl">Élite</div><div class="pv">2</div><div class="param-note">§5</div></div>
-    <div class="param-box"><div class="pl">Torneo k</div><div class="pv">3</div><div class="param-note">§5</div></div>
-    <div class="param-box"><div class="pl">Estagnación</div><div class="pv">50</div></div>
-    <div class="param-box"><div class="pl">Semi-heurís.</div><div class="pv">20 %</div><div class="param-note">§6</div></div>
-    <div class="param-box full"><div class="pl">Mut. guiada prob.</div><div class="pv">0.50</div><div class="param-note">§4.2 Mejora 5</div></div>
-    <div class="param-box full"><div class="pl">Reparación prob.</div><div class="pv">0.80</div><div class="param-note">§4.3 Mejora 6</div></div>
-    <div class="param-box full"><div class="pl">Semilla</div><div class="pv">42</div><div class="param-note">reproducible §2.1</div></div>
-  </div>
-
-  <div class="sec-lbl" style="margin-top:4px">Resultado (AG libre)</div>
-  <div class="mg">
-    <div class="met full"><div class="ml">Fitness</div><div class="mv ca" id="r-fit">—</div></div>
-    <div class="met"><div class="ml">Satisfacción</div><div class="mv co" id="r-sat">—</div></div>
-    <div class="met"><div class="ml">Costo bonos</div><div class="mv cw" id="r-cost" style="font-size:12px">—</div></div>
-    <div class="met full"><div class="ml">Corrida actual</div><div class="mv cp" id="r-label" style="font-size:12px">—</div></div>
-  </div>
-
-  <div class="sec-lbl" style="margin-top:4px">Ejecutar corrida libre</div>
-  <div class="corrida-btns">
-    <button class="cbtn" id="cbtn-1" onclick="runFree(1)"><span class="num cn1">C1</span><div><div style="font-size:11px;font-weight:600">Línea base</div><div style="font-size:9px;color:var(--txt3)">Cruce 1 punto · sin mejoras extra</div></div></button>
-    <button class="cbtn" id="cbtn-2" onclick="runFree(2)"><span class="num cn2">C2</span><div><div style="font-size:11px;font-weight:600">Cruce uniforme</div><div style="font-size:9px;color:var(--txt3)">Mejora 4 activa</div></div></button>
-    <button class="cbtn" id="cbtn-3" onclick="runFree(3)"><span class="num cn3">C3</span><div><div style="font-size:11px;font-weight:600">Mutación guiada</div><div style="font-size:9px;color:var(--txt3)">Mejora 5 — pref. establecimiento</div></div></button>
-    <button class="cbtn" id="cbtn-4" onclick="runFree(4)"><span class="num cn4">C4</span><div><div style="font-size:11px;font-weight:600">Con reparación</div><div style="font-size:9px;color:var(--txt3)">Mejora 6 activa</div></div></button>
-  </div>
-</aside>
-
 <main class="content">
-  <div class="card" style="flex-shrink:0">
-    <div class="card-body" style="padding:6px 10px">
-      <div class="tabs">
-        <button class="tab active" onclick="switchTab('libre')">📈 AG Libre</button>
-        <button class="tab" onclick="switchTab('corridas')">🧪 4 Corridas</button>
-        <button class="tab" onclick="switchTab('establecimientos')">🏨 Establecimientos</button>
-        <button class="tab" onclick="switchTab('asignaciones')">👨‍⚕️ Asignaciones</button>
-        <button class="tab" onclick="switchTab('desglose')">📊 Desglose</button>
-        <button class="tab" onclick="switchTab('informe')">📄 Informe</button>
+
+  <!-- PANTALLA DE BIENVENIDA (visible hasta primera ejecución) -->
+  <div class="card" id="welcome-screen">
+    <div class="card-body">
+      <div class="welcome">
+        <div class="welcome-icon">🧬</div>
+        <div class="welcome-title">Optimización por Algoritmo Genético</div>
+        <div class="welcome-sub">
+          Se ejecutarán <strong style="color:var(--acc2)">4 corridas en paralelo</strong>, cada una variando un único factor experimental sobre la misma instancia (N=30 médicos, M=8 establecimientos, semilla=42).
+        </div>
+        <div class="welcome-chips">
+          <span class="welcome-chip">C1 · Línea base</span>
+          <span class="welcome-chip">C2 · Cruce uniforme</span>
+          <span class="welcome-chip">C3 · Mutación guiada</span>
+          <span class="welcome-chip">C4 · Con reparación</span>
+        </div>
+        <button class="welcome-btn" id="btn-welcome" onclick="runCorridas(false)">▶ Ejecutar las 4 corridas</button>
       </div>
     </div>
   </div>
 
-  <!-- AG LIBRE -->
-  <div class="tc active card" id="tc-libre">
-    <div class="card-hdr">
-      <div class="card-title">📈 Convergencia — AG Libre</div>
-      <span style="font-size:10px;color:var(--txt3);font-family:var(--mono)" id="gen-ctr">Gen: —</span>
-    </div>
-    <div class="card-body">
-      <div class="ch"><canvas id="cvs-libre"></canvas></div>
-      <div class="chart-legend">
-        <span><span class="leg-line" style="background:var(--acc)"></span>Mejor fitness</span>
-        <span><span class="leg-line" style="background:var(--acc2);opacity:.6"></span>Fitness promedio</span>
-      </div>
-      <div class="empty" id="cvs-libre-empty" style="margin-top:12px">
-        <div class="ic">📉</div><h3>Sin datos</h3>
-        <p>Selecciona una corrida en el panel lateral para ejecutar el AG.</p>
-      </div>
-    </div>
-  </div>
+  <!-- CONTENIDO PRINCIPAL (oculto hasta primera ejecución) -->
+  <div id="main-content" style="display:none;flex-direction:column;gap:12px">
 
-  <!-- 4 CORRIDAS -->
-  <div class="tc card" id="tc-corridas">
-    <div class="card-hdr">
-      <div class="card-title">🧪 4 Corridas Experimentales en Paralelo</div>
-      <div style="display:flex;gap:7px;align-items:center">
-        <button class="btn btn-ok" id="btn-corridas" onclick="runCorridas()">▶ Ejecutar las 4 juntas</button>
-        <button class="btn btn-ghost" onclick="resetCorridas()">🗑 Reiniciar</button>
+    <div class="card" style="flex-shrink:0">
+      <div class="card-body" style="padding:6px 10px">
+        <div class="tabs">
+          <button class="tab active" onclick="switchTab('corridas')">🧪 4 Corridas</button>
+          <button class="tab" onclick="switchTab('establecimientos')">🏨 Establecimientos</button>
+          <button class="tab" onclick="switchTab('asignaciones')">👨‍⚕️ Asignaciones</button>
+          <button class="tab" onclick="switchTab('desglose')">📊 Desglose</button>
+        </div>
       </div>
     </div>
-    <div class="card-body">
-      <p style="font-size:11px;color:var(--txt2);margin-bottom:12px;line-height:1.6">
-        Las 4 corridas usan la <b>instancia exacta de la Tabla 2</b> y la <b>misma semilla (42)</b>, variando un único factor por corrida (Tabla 3 del informe). Corren en hilos independientes en paralelo.
-      </p>
-      <div class="card" style="margin-bottom:12px">
-        <div class="card-hdr"><div class="card-title">📈 Convergencia comparativa</div></div>
-        <div class="card-body">
-          <div class="cmp-legend">
-            <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c1)"></div><span>C1 · Línea base</span></div>
-            <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c2)"></div><span>C2 · Cruce uniforme</span></div>
-            <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c3)"></div><span>C3 · Mutación guiada</span></div>
-            <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c4)"></div><span>C4 · Con reparación</span></div>
+
+    <!-- 4 CORRIDAS -->
+    <div class="tc active card" id="tc-corridas">
+      <div class="card-hdr">
+        <div class="card-title">🧪 4 Corridas Experimentales en Paralelo</div>
+        <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-ok" id="btn-corridas-rnd" onclick="runCorridas(true)">🎲 Nueva corrida</button>
+          <button class="btn btn-ghost" onclick="resetCorridas()">🗑 Reiniciar</button>
+        </div>
+      </div>
+      <div class="card-body">
+
+        <div class="card" style="margin-bottom:12px">
+          <div class="card-hdr"><div class="card-title">📈 Convergencia comparativa</div></div>
+          <div class="card-body">
+            <div class="cmp-legend">
+              <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c1)"></div><span>C1 · Línea base</span></div>
+              <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c2)"></div><span>C2 · Cruce uniforme</span></div>
+              <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c3)"></div><span>C3 · Mutación guiada</span></div>
+              <div class="cmp-legend-item"><div class="cleg-dot" style="background:var(--c4)"></div><span>C4 · Con reparación</span></div>
+            </div>
+            <div class="compare-chart"><canvas id="cvs-compare"></canvas></div>
           </div>
-          <div class="compare-chart"><canvas id="cvs-compare"></canvas></div>
+        </div>
+        <div class="tw" style="margin-bottom:12px;max-height:145px">
+          <table><thead><tr>
+            <th>Corrida</th><th>Factor</th><th>Hipótesis</th><th>Estado</th>
+            <th>Fitness</th><th>Satisf.</th><th>P.Cap</th><th>P.Epi</th><th>P.Ppto</th><th>Costo</th><th>Gen.</th>
+          </tr></thead>
+          <tbody id="cr-tbody"></tbody></table>
+        </div>
+        <div class="corridas-grid" id="corridas-grid"></div>
+      </div>
+    </div>
+
+    <!-- ESTABLECIMIENTOS -->
+    <div class="tc card" id="tc-establecimientos">
+      <div class="card-hdr"><div class="card-title">🏨 Establecimientos</div></div>
+      <div class="card-body">
+        <div id="banner-est" style="display:none;margin-bottom:12px"></div>
+        <div class="fact-grid" style="margin-bottom:12px">
+          <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 1 — Capacidad ≥ N</div><div class="fact-val">ΣC = 38 ≥ 30 ✓</div></div></div>
+          <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 2 — Cuotas ≤ N</div><div class="fact-val">ΣQ = 19 ≤ 30 ✓</div></div></div>
+          <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 3 — Q_j ≤ C_j</div><div class="fact-val">8/8 centros ✓</div></div></div>
+          <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 4 — K_mín ≤ B</div><div class="fact-val">48 000 ≤ 50 000 ✓</div></div></div>
+        </div>
+        <div class="eg" id="est-grid"></div>
+      </div>
+    </div>
+
+    <!-- ASIGNACIONES -->
+    <div class="tc card" id="tc-asignaciones">
+      <div class="card-hdr">
+        <div class="card-title">👨‍⚕️ Asignación Individual</div>
+        <span id="a-cnt" style="font-size:10px;color:var(--txt3)">0 asig.</span>
+      </div>
+      <div id="banner-asig" style="display:none;padding:0 12px;margin-top:10px;margin-bottom:2px"></div>
+      <div class="frow">
+        <input class="finp" id="flt-n" placeholder="🔍 Médico o establecimiento…" oninput="applyF()">
+        <select class="fsel" id="flt-r" onchange="applyF()">
+          <option value="">Todos los riesgos</option>
+          <option value="Alto">🔴 Alto</option><option value="Medio">🟡 Medio</option><option value="Bajo">🟢 Bajo</option>
+        </select>
+        <select class="fsel" id="flt-p" onchange="applyF()">
+          <option value="">Todos los puntos</option>
+          <option value="30">30 — 1ª pref.</option><option value="20">20 — 2ª pref.</option>
+          <option value="10">10 — 3ª pref.</option><option value="0">0 — fuera</option>
+        </select>
+        <span id="flt-cnt" style="font-size:10px;color:var(--txt3);margin-left:auto"></span>
+      </div>
+      <div class="tw" id="tbl-wrap">
+        <div class="empty"><div class="ic">🩺</div><h3>Sin asignaciones</h3><p>Ejecuta las corridas primero.</p></div>
+      </div>
+    </div>
+
+    <!-- DESGLOSE -->
+    <div class="tc card" id="tc-desglose">
+      <div class="card-hdr"><div class="card-title">📊 Desglose del Fitness</div></div>
+      <div class="card-body">
+        <div id="banner-desglose" style="display:none;margin-bottom:12px"></div>
+        <div class="empty" id="bd-empty"><div class="ic">📐</div><h3>Sin resultados</h3><p>Ejecuta las corridas primero.</p></div>
+        <div id="bd-content" style="display:none">
+          <div class="bdg-grid">
+            <div class="bc"><div class="bl">FITNESS</div><div class="bv ca" id="bd-fit">—</div></div>
+            <div class="bc"><div class="bl">Satisfacción</div><div class="bv co" id="bd-sat">—</div></div>
+            <div class="bc"><div class="bl">Pen. Capacidad</div><div class="bv ce" id="bd-pc">—</div></div>
+            <div class="bc"><div class="bl">Pen. Epidemiol.</div><div class="bv ce" id="bd-pe">—</div></div>
+            <div class="bc"><div class="bl">Pen. Presupuesto</div><div class="bv ce" id="bd-pb">—</div></div>
+            <div class="bc"><div class="bl">Costo total</div><div class="bv cw" id="bd-ct">—</div></div>
+            <div class="bc"><div class="bl">Presupuesto B</div><div class="bv cc">S/ 50 000</div></div>
+            <div class="bc"><div class="bl">Exceso</div><div class="bv" id="bd-ex">—</div></div>
+          </div>
+          <div style="margin:10px 0 12px">
+            <div style="font-size:10px;font-weight:700;margin-bottom:6px;color:var(--txt2)">Distribución de satisfacción — por preferencia de establecimiento (N=30)</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap" id="sat-dist"></div>
+          </div>
+          <div class="formula-box">
+            FITNESS(x) = S(x) − [ P<sub>cap</sub>(x) + P<sub>epi</sub>(x) + P<sub>pre</sub>(x) ]<br>
+            <span style="color:var(--acc2)">S(x) = Σ s(i)  ·  +30 (1ª pref. estab.)  ·  +20 (2ª)  ·  +10 (3ª)  ·  0 (sin pref.)</span><br>
+            <span style="color:var(--err)">P<sub>cap</sub> = 1000 · Σ max(0, n_j − C_j)           — penalización por exceso de capacidad</span><br>
+            <span style="color:var(--err)">P<sub>epi</sub> = Σ w_j · max(0, Q_j − n_j)  w={Alto:500, Medio:250, Bajo:100}  — penalización epidemiológica</span><br>
+            <span style="color:var(--warn)">P<sub>pre</sub> = 0.5 · max(0, K(x) − B)              — penalización por exceso de presupuesto</span>
+          </div>
         </div>
       </div>
-      <div class="tw" style="margin-bottom:12px;max-height:145px">
-        <table><thead><tr>
-          <th>Corrida</th><th>Factor</th><th>Hipótesis §8.1</th><th>Estado</th>
-          <th>Fitness</th><th>Satisf.</th><th>P.Cap</th><th>P.Epi</th><th>P.Ppto</th><th>Costo</th><th>Gen.</th>
-        </tr></thead>
-        <tbody id="cr-tbody"></tbody></table>
-      </div>
-      <div class="corridas-grid" id="corridas-grid"></div>
     </div>
-  </div>
 
-  <!-- ESTABLECIMIENTOS -->
-  <div class="tc card" id="tc-establecimientos">
-    <div class="card-hdr"><div class="card-title">🏨 Establecimientos — Tabla 2 del informe</div></div>
-    <div class="card-body">
-      <div class="fact-grid" style="margin-bottom:12px">
-        <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 1 — Capacidad ≥ N</div><div class="fact-val">ΣC = 38 ≥ 30 ✓</div></div></div>
-        <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 2 — Cuotas ≤ N</div><div class="fact-val">ΣQ = 19 ≤ 30 ✓</div></div></div>
-        <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 3 — Q_j ≤ C_j</div><div class="fact-val">8/8 centros ✓</div></div></div>
-        <div class="fact-row"><span style="font-size:13px">✅</span><div class="fact-text"><div class="fact-lbl">Condición 4 — K_mín ≤ B</div><div class="fact-val">48 000 ≤ 50 000 ✓</div></div></div>
-      </div>
-      <div class="eg" id="est-grid"></div>
-    </div>
-  </div>
-
-  <!-- ASIGNACIONES -->
-  <div class="tc card" id="tc-asignaciones">
-    <div class="card-hdr">
-      <div class="card-title">👨‍⚕️ Asignación Individual — AG Libre</div>
-      <span id="a-cnt" style="font-size:10px;color:var(--txt3)">0 asig.</span>
-    </div>
-    <div class="frow">
-      <input class="finp" id="flt-n" placeholder="🔍 Médico o establecimiento…" oninput="applyF()">
-      <select class="fsel" id="flt-r" onchange="applyF()">
-        <option value="">Todos los riesgos</option>
-        <option value="Alto">🔴 Alto</option><option value="Medio">🟡 Medio</option><option value="Bajo">🟢 Bajo</option>
-      </select>
-      <select class="fsel" id="flt-p" onchange="applyF()">
-        <option value="">Todos los puntos</option>
-        <option value="30">30 — 1ª pref.</option><option value="20">20 — 2ª pref.</option>
-        <option value="10">10 — 3ª pref.</option><option value="0">0 — fuera</option>
-      </select>
-      <span id="flt-cnt" style="font-size:10px;color:var(--txt3);margin-left:auto"></span>
-    </div>
-    <div class="tw" id="tbl-wrap">
-      <div class="empty"><div class="ic">🩺</div><h3>Sin asignaciones</h3><p>Ejecuta una corrida en el panel lateral.</p></div>
-    </div>
-  </div>
-
-  <!-- DESGLOSE -->
-  <div class="tc card" id="tc-desglose">
-    <div class="card-hdr"><div class="card-title">📊 Desglose del Fitness — AG Libre</div></div>
-    <div class="card-body">
-      <div class="empty" id="bd-empty"><div class="ic">📐</div><h3>Sin resultados</h3><p>Ejecuta una corrida.</p></div>
-      <div id="bd-content" style="display:none">
-        <div class="bdg-grid">
-          <div class="bc"><div class="bl">FITNESS</div><div class="bv ca" id="bd-fit">—</div></div>
-          <div class="bc"><div class="bl">Satisfacción</div><div class="bv co" id="bd-sat">—</div></div>
-          <div class="bc"><div class="bl">Pen. Capacidad</div><div class="bv ce" id="bd-pc">—</div></div>
-          <div class="bc"><div class="bl">Pen. Epidemiol.</div><div class="bv ce" id="bd-pe">—</div></div>
-          <div class="bc"><div class="bl">Pen. Presupuesto</div><div class="bv ce" id="bd-pb">—</div></div>
-          <div class="bc"><div class="bl">Costo total</div><div class="bv cw" id="bd-ct">—</div></div>
-          <div class="bc"><div class="bl">Presupuesto B</div><div class="bv cc">S/ 50 000</div></div>
-          <div class="bc"><div class="bl">Exceso</div><div class="bv" id="bd-ex">—</div></div>
-        </div>
-        <div style="margin:10px 0 12px">
-          <div style="font-size:10px;font-weight:700;margin-bottom:6px;color:var(--txt2)">Distribución de satisfacción — por preferencia de establecimiento (N=30)</div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap" id="sat-dist"></div>
-        </div>
-        <div class="formula-box">
-          FITNESS(x) = S(x) − [ P<sub>cap</sub>(x) + P<sub>epi</sub>(x) + P<sub>pre</sub>(x) ]<br>
-          <span style="color:var(--acc2)">S(x) = Σ s(i)  ·  +30 (1ª pref. estab.)  ·  +20 (2ª)  ·  +10 (3ª)  ·  0 (sin pref.)</span><br>
-          <span style="color:var(--err)">P<sub>cap</sub> = 1000 · Σ max(0, n_j − C_j)           [Mejora 2 — proporcional]</span><br>
-          <span style="color:var(--err)">P<sub>epi</sub> = Σ w_j · max(0, Q_j − n_j)  w={Alto:500, Medio:250, Bajo:100}  [Mejora 3]</span><br>
-          <span style="color:var(--warn)">P<sub>pre</sub> = 0.5 · max(0, K(x) − B)              [Mejora 2 — lineal]</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- INFORME -->
-  <div class="tc card" id="tc-informe">
-    <div class="card-hdr"><div class="card-title">📄 Resumen del Informe — Grupo 6 UNMSM 2026-I</div></div>
-    <div class="card-body">
-      <div class="info-note">
-        <b style="color:var(--acc)">§2.1 — Modelo de preferencias (sobre establecimientos)</b><br>
-        Cada médico posee un ranking de <b>3 establecimientos preferidos</b> (1ª, 2ª y 3ª opción), elegidos entre los M = 8 centros de la Tabla 2 mediante semilla 42. La función de aptitud §3.1 puntúa: <b>+30</b> pts si se asigna al médico su 1ª preferencia, <b>+20</b> pts la 2ª, <b>+10</b> pts la 3ª, y <b>0</b> pts si el establecimiento asignado no figura entre sus tres opciones.
-      </div>
-      <div style="margin-bottom:14px">
-        <div style="font-size:10px;font-weight:700;color:var(--txt3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">6 Mejoras propuestas (§9 · Tabla 4)</div>
-        <table class="mejoras-table" style="border:1px solid var(--brd);border-radius:8px;overflow:hidden">
-          <thead><tr><th>N°</th><th>Mejora</th><th>Beneficio principal</th><th>Sección</th></tr></thead>
-          <tbody>
-            <tr><td class="m-num">M1</td><td class="m-name">Verificación previa de factibilidad</td><td class="m-benefit">Evita correr sobre instancias imposibles</td><td class="tm" style="color:var(--txt3)">§2.2</td></tr>
-            <tr><td class="m-num">M2</td><td class="m-name">Penalizaciones proporcionales</td><td class="m-benefit">Crea gradiente; elimina mesetas de fitness</td><td class="tm" style="color:var(--txt3)">§3.2–3.4</td></tr>
-            <tr><td class="m-num">M3</td><td class="m-name">Cuota mínima ponderada por riesgo</td><td class="m-benefit">Cobertura más equilibrada y realista</td><td class="tm" style="color:var(--txt3)">§3.3</td></tr>
-            <tr><td class="m-num">M4</td><td class="m-name">Cruce uniforme configurable</td><td class="m-benefit">Mejor mezcla en codificación de asignación</td><td class="tm" style="color:var(--txt3)">§4.1</td></tr>
-            <tr><td class="m-num">M5</td><td class="m-name">Mutación guiada por preferencia de establecimiento</td><td class="m-benefit">Dirige exploración hacia alta satisfacción</td><td class="tm" style="color:var(--txt3)">§4.2</td></tr>
-            <tr><td class="m-num">M6</td><td class="m-name">Operador de reparación de sobrecapacidad</td><td class="m-benefit">Acelera convergencia a soluciones factibles</td><td class="tm" style="color:var(--txt3)">§4.3</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div style="margin-bottom:14px">
-        <div style="font-size:10px;font-weight:700;color:var(--txt3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Plan de corridas (§8.1 · Tabla 3)</div>
-        <table class="mejoras-table" style="border:1px solid var(--brd);border-radius:8px;overflow:hidden">
-          <thead><tr><th>Corrida</th><th>Configuración</th><th>Factor estudiado</th><th>Hipótesis</th></tr></thead>
-          <tbody>
-            <tr><td class="m-num" style="color:var(--c1)">C1</td><td class="m-name">Parámetros base</td><td class="m-benefit">Referencia de comparación</td><td style="color:var(--txt3);font-size:10px">—</td></tr>
-            <tr><td class="m-num" style="color:var(--c2)">C2</td><td class="m-name">Cruce uniforme vs. un punto</td><td class="m-benefit">Tipo de cruzamiento (M4)</td><td style="color:var(--txt3);font-size:10px">Mejor mezcla genética</td></tr>
-            <tr><td class="m-num" style="color:var(--c3)">C3</td><td class="m-name">Mutación guiada por establecimiento preferido</td><td class="m-benefit">Mutación dirigida (M5)</td><td style="color:var(--txt3);font-size:10px">Mayor satisfacción</td></tr>
-            <tr><td class="m-num" style="color:var(--c4)">C4</td><td class="m-name">Con operador de reparación</td><td class="m-benefit">Manejo de restricciones (M6)</td><td style="color:var(--txt3);font-size:10px">Converge más rápido</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
+  </div><!-- /main-content -->
 </main>
 </div>
 </div>
@@ -883,15 +785,13 @@ tbody td{padding:7px 10px;vertical-align:middle}
   <div class="ov-box">
     <div class="spin"></div>
     <div style="font-size:16px;font-weight:700;margin-bottom:4px">Optimizando…</div>
-    <div style="font-size:11px;color:var(--txt2)" id="ov-label">El AG evalúa poblaciones, cruces y mutaciones.</div>
-    <div class="ov-gen" id="ov-gen">Generación: 0</div>
-    <div class="ov-prog"><div class="ov-bar" id="ov-bar" style="width:0%"></div></div>
+    <div style="font-size:11px;color:var(--txt2)">Ejecutando 4 corridas en paralelo…</div>
   </div>
 </div>
 
 <script>
 let S={},allSol=[],pollInt=null;
-let charts={libre:null,compare:null};
+let charts={compare:null};
 const COLORS={1:'#3b7fff',2:'#f5a623',3:'#1fd8a4',4:'#b07ef8'};
 const FACTORS={1:'Referencia',2:'Tipo cruzamiento (M4)',3:'Mutación por estab. preferido (M5)',4:'Manejo restricciones (M6)'};
 const HYP={1:'—',2:'Mejor mezcla',3:'Mayor satisfacción',4:'Converge antes'};
@@ -950,35 +850,26 @@ function drawCompare(cmpData){
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   document.querySelectorAll('.tc').forEach(c=>c.classList.remove('active'));
-  const order=['libre','corridas','establecimientos','asignaciones','desglose','informe'];
+  const order=['corridas','establecimientos','asignaciones','desglose'];
   document.querySelectorAll('.tab')[order.indexOf(t)].classList.add('active');
   document.getElementById('tc-'+t).classList.add('active');
-  if(t==='libre')setTimeout(()=>charts.libre&&charts.libre.resize(),10);
-  if(t==='corridas')setTimeout(()=>charts.compare&&charts.compare.resize(),10);
 }
 function fm(v){return'S/ '+Number(v).toLocaleString('es-PE');}
 function rb(r){const m={'Alto':'ba','Medio':'bm','Bajo':'bb'},d={'Alto':'🔴','Medio':'🟡','Bajo':'🟢'};return`<span class="bdg ${m[r]||''}">${d[r]||''} ${r}</span>`;}
 function pb(p){const m={30:'b30',20:'b20',10:'b10',0:'b0'},l={30:'30·1ª',20:'20·2ª',10:'10·3ª',0:'0·—'};return`<span class="bdg ${m[p]||'b0'}">${l[p]||'—'}</span>`;}
 
-function renderFreeResult(s){
-  if(!s.free_breakdown){['r-fit','r-sat','r-cost'].forEach(id=>document.getElementById(id).textContent='—');document.getElementById('r-label').textContent='—';return;}
-  const b=s.free_breakdown;
-  document.getElementById('r-fit').textContent=b.fitness.toFixed(0);
-  document.getElementById('r-sat').textContent=b.satisfaction_total;
-  document.getElementById('r-cost').textContent=fm(b.total_cost);
-  document.getElementById('r-label').textContent=s.free_config_label||'—';
+function showMainContent(){
+  document.getElementById('welcome-screen').style.display='none';
+  const mc=document.getElementById('main-content');
+  mc.style.display='flex';
+  // Init compare chart after it becomes visible
+  if(!charts.compare)charts.compare=mkChart('cvs-compare');
 }
-function renderConvergence(s){
-  const em=document.getElementById('cvs-libre-empty'),cv=document.getElementById('cvs-libre');
-  const gp=s.free_ga_progress;
-  if(!gp||!gp.history_best||gp.history_best.length<2){em.style.display='block';cv.style.display='none';document.getElementById('gen-ctr').textContent='Gen: —';return;}
-  em.style.display='none';cv.style.display='block';
-  document.getElementById('gen-ctr').textContent=`Gen: ${gp.current_gen}`;
-  if(charts.libre){charts.libre.data={best:gp.history_best,mean:gp.history_mean};drawSingle(charts.libre);}
-}
+
 function renderEst(s){
   const asgn=s.free_breakdown?s.free_breakdown.assigned_per_establishment:{};
-  document.getElementById('est-grid').innerHTML=s.establishments.map((e,i)=>{
+  const grid=document.getElementById('est-grid');if(!grid)return;
+  grid.innerHTML=s.establishments.map((e,i)=>{
     const cnt=asgn[String(i)]||0,ratio=e.capacity_max>0?Math.min(cnt/e.capacity_max,1):0;
     let sc='st-ok',st='✓ OK',bc='var(--ok)';
     if(cnt>e.capacity_max){sc='st-ov';st='⚠ Exceso';bc='var(--err)';}
@@ -997,17 +888,16 @@ function renderEst(s){
 }
 function renderAssign(s){
   allSol=s.free_decoded||[];
-  document.getElementById('a-cnt').textContent=`${allSol.length} asig.`;
+  const cnt=document.getElementById('a-cnt');if(cnt)cnt.textContent=`${allSol.length} asig.`;
   applyF();
 }
 function applyF(){
-  const nq=document.getElementById('flt-n').value.toLowerCase(),rq=document.getElementById('flt-r').value,pq=document.getElementById('flt-p').value;
-  const f=allSol.filter(x=>(!nq||(x.doctor_name+x.assigned_establishment_name).toLowerCase().includes(nq))&&(!rq||x.assigned_risk_level===rq)&&(!pq||String(x.satisfaction_points)===pq));
-  document.getElementById('flt-cnt').textContent=f.length?`${f.length} resultados`:'';
-  const w=document.getElementById('tbl-wrap');
-  if(!allSol.length){w.innerHTML='<div class="empty"><div class="ic">🩺</div><h3>Sin asignaciones</h3><p>Ejecuta una corrida desde el panel lateral.</p></div>';return;}
+  const nq=(document.getElementById('flt-n')||{}).value||'',rq=(document.getElementById('flt-r')||{}).value||'',pq=(document.getElementById('flt-p')||{}).value||'';
+  const f=allSol.filter(x=>(!nq||(x.doctor_name+x.assigned_establishment_name).toLowerCase().includes(nq.toLowerCase()))&&(!rq||x.assigned_risk_level===rq)&&(!pq||String(x.satisfaction_points)===pq));
+  const fc=document.getElementById('flt-cnt');if(fc)fc.textContent=f.length?`${f.length} resultados`:'';
+  const w=document.getElementById('tbl-wrap');if(!w)return;
+  if(!allSol.length){w.innerHTML='<div class="empty"><div class="ic">🩺</div><h3>Sin asignaciones</h3><p>Ejecuta las corridas primero.</p></div>';return;}
   if(!f.length){w.innerHTML='<div class="empty"><div class="ic">🔍</div><h3>Sin resultados</h3><p>Ajusta los filtros.</p></div>';return;}
-  // Columnas de preferencias muestran NOMBRES de establecimientos
   w.innerHTML=`<table><thead><tr>
     <th>#</th><th>Médico</th>
     <th>1ª Pref. (estab.)</th><th>2ª Pref. (estab.)</th><th>3ª Pref. (estab.)</th>
@@ -1026,6 +916,7 @@ function applyF(){
 }
 function renderDesglose(s){
   const em=document.getElementById('bd-empty'),ct=document.getElementById('bd-content');
+  if(!em||!ct)return;
   if(!s.free_breakdown){em.style.display='block';ct.style.display='none';return;}
   em.style.display='none';ct.style.display='block';
   const b=s.free_breakdown;
@@ -1050,7 +941,8 @@ function renderDesglose(s){
 }
 function renderCorridas(s){
   const crs=s.corridas;
-  document.getElementById('cr-tbody').innerHTML=[1,2,3,4].map(n=>{
+  const tb=document.getElementById('cr-tbody');if(!tb)return;
+  tb.innerHTML=[1,2,3,4].map(n=>{
     const c=crs[String(n)],color=COLORS[n];
     const stCls={'idle':'','running':'cw','done':'co','error':'ce'}[c.status]||'';
     const stTxt={'idle':'⏳ esperando','running':'⚙ ejecutando…','done':'✓ listo','error':'✗ error'}[c.status]||'';
@@ -1063,14 +955,15 @@ function renderCorridas(s){
   }).join('');
   const cmpData={};
   [1,2,3,4].forEach(n=>{const c=crs[String(n)];if(c.ga_progress?.history_best?.length>=2)cmpData[n]=c.ga_progress.history_best;});
-  if(Object.keys(cmpData).length)drawCompare(cmpData);
+  if(Object.keys(cmpData).length&&charts.compare)drawCompare(cmpData);
   const confTxt={
     1:'Cruce: un punto · Mutación: aleatoria · Sin reparación',
     2:`<b style="color:var(--c2)">Cruce: uniforme (M4)</b> · Mutación: aleatoria · Sin reparación`,
     3:`Cruce: un punto · <b style="color:var(--c3)">Mutación: guiada por estab. preferido (M5)</b> · Sin reparación`,
     4:`Cruce: un punto · Mutación: aleatoria · <b style="color:var(--c4)">Reparación activa (M6)</b>`,
   };
-  document.getElementById('corridas-grid').innerHTML=[1,2,3,4].map(n=>{
+  const cg=document.getElementById('corridas-grid');if(!cg)return;
+  cg.innerHTML=[1,2,3,4].map(n=>{
     const c=crs[String(n)],color=COLORS[n];
     const stCls={'idle':'cs-idle','running':'cs-running','done':'cs-done','error':'cs-error'}[c.status]||'cs-idle';
     const stTxt={'idle':'Esperando','running':'Ejecutando…','done':'Completado','error':'Error'}[c.status]||'—';
@@ -1084,8 +977,9 @@ function renderCorridas(s){
       <div class="cm"><div class="cml">Costo</div><div class="cmv cw" style="font-size:10px">${fm(b.total_cost)}</div></div>
     </div>`;}
     const mini=c.ga_progress?.history_best?.length>=2?`<div class="corrida-chart"><canvas id="mini-${n}"></canvas></div>`:`<div class="corrida-empty">${c.status==='idle'?'Esperando…':c.status==='running'?'Calculando…':''}</div>`;
-    return`<div class="corrida-card">
-      <div class="corrida-hdr"><div style="display:flex;align-items:center"><div class="num cn${n}">${n}</div><div><div class="corrida-label">${c.label}</div><div class="corrida-factor">${FACTORS[n]}</div></div></div><span class="cs ${stCls}">${stTxt}</span></div>
+    const clickable=c.breakdown?` style="cursor:pointer" onclick="selectCorrida(${n})":`:'';
+    return`<div class="corrida-card"${clickable}>
+      <div class="corrida-hdr"><div style="display:flex;align-items:center"><div class="num cn${n}" style="width:20px;height:20px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;background:rgba(59,127,255,.2);color:var(--c${n})">${n}</div><div><div class="corrida-label">${c.label}</div><div class="corrida-factor">${FACTORS[n]}</div></div></div><span class="cs ${stCls}">${stTxt}</span></div>
       <div class="corrida-body"><div style="font-size:9px;color:var(--txt3);margin-bottom:8px;line-height:1.8">${confTxt[n]}</div>${mH}${mini}</div>
     </div>`;
   }).join('');
@@ -1094,35 +988,65 @@ function renderCorridas(s){
     if(c.ga_progress?.history_best?.length>=2){const mc=mkChart(`mini-${n}`);if(mc){mc.data={best:c.ga_progress.history_best,mean:[]};drawSingle(mc,COLORS[n]);}}
   });
 }
+function buildBanner(info){
+  if(!info)return'';
+  const crossMap={'single_point':'Un punto','uniform':'Uniforme'};
+  const cross=crossMap[info.crossover_type]||info.crossover_type;
+  const guided=info.guided_mutation?'<span class="bb-tag">Mutación guiada ✓</span>':'';
+  const repair=info.repair_enabled?'<span class="bb-tag">Reparación ✓</span>':'';
+  const seedTag=`<span class="bb-tag ${info.seed!==42?'rnd':''}">seed=${info.seed}</span>`;
+  const batchTag=`<span class="rc-badge">batch #${info.run_count}</span>`;
+  const star=info.is_best?'🏆':'📌';
+  return`<div class="best-banner"><span class="bb-icon">${star}</span>
+    <div><span class="bb-title">C${info.corrida_num} · ${info.label}</span>
+    Mostrando la corrida con <b>mayor fitness</b> del último batch.
+    Cruce: <b>${cross}</b> ${guided}${repair} ${seedTag} ${batchTag}</div></div>`;
+}
 function renderAll(s){
   S=s;
-  renderFreeResult(s);renderConvergence(s);renderEst(s);renderAssign(s);renderDesglose(s);renderCorridas(s);
+  if(s.has_run_once){
+    showMainContent();
+    renderEst(s);renderAssign(s);renderDesglose(s);renderCorridas(s);
+    // Banners en pestañas secundarias
+    const banner=buildBanner(s.best_info);
+    ['banner-est','banner-asig','banner-desglose'].forEach(id=>{
+      const el=document.getElementById(id);if(!el)return;
+      el.innerHTML=banner;el.style.display=banner?'block':'none';
+    });
+  }
   document.getElementById('smsg').textContent=s.status_message;
   document.getElementById('sdot').className='sdot '+(s.status_type||'info');
-  const busy=s.free_optimizing||s.corridas_running;
-  document.getElementById('overlay').classList.toggle('on',s.free_optimizing&&!s.corridas_running);
-  if(s.free_optimizing&&s.free_ga_progress){
-    const gen=s.free_ga_progress.current_gen||0;
-    document.getElementById('ov-gen').textContent=`Generación: ${gen}`;
-    document.getElementById('ov-label').textContent=`Corrida: ${s.free_config_label||'…'}`;
-    document.getElementById('ov-bar').style.width=`${Math.min(100,(gen/500)*100).toFixed(1)}%`;
-  }
-  [1,2,3,4].forEach(n=>{const b=document.getElementById(`cbtn-${n}`);if(b)b.disabled=busy;});
-  const bc=document.getElementById('btn-corridas');if(bc)bc.disabled=s.corridas_running;
+  document.getElementById('overlay').classList.toggle('on',s.corridas_running);
+  // Deshabilitar todos los botones de ejecución mientras corre
+  ['btn-corridas-rnd','btn-welcome'].forEach(id=>{
+    const b=document.getElementById(id);if(b)b.disabled=s.corridas_running;
+  });
 }
 async function fetchState(){try{renderAll(await(await fetch('/api/state')).json());}catch(e){}}
-async function runFree(n){await fetch(`/api/run_free?corrida=${n}`,{method:'POST'});switchTab('libre');startPoll();}
-async function runCorridas(){await fetch('/api/run_corridas',{method:'POST'});switchTab('corridas');startPoll();}
-async function resetCorridas(){await fetch('/api/reset_corridas',{method:'POST'});await fetchState();}
+async function runCorridas(useRandom){
+  ['btn-welcome','btn-corridas-rnd'].forEach(id=>{
+    const b=document.getElementById(id);if(b)b.disabled=true;
+  });
+  await fetch(`/api/run_corridas?random=${useRandom?1:0}`,{method:'POST'});
+  startPoll();
+}
+async function resetCorridas(){
+  await fetch('/api/reset_corridas',{method:'POST'});
+  // Show welcome screen again
+  document.getElementById('welcome-screen').style.display='block';
+  document.getElementById('main-content').style.display='none';
+  charts.compare=null;
+  await fetchState();
+}
+async function selectCorrida(n){await fetch(`/api/select_corrida?num=${n}`,{method:'POST'});await fetchState();}
 function startPoll(){
   if(pollInt)clearInterval(pollInt);
-  pollInt=setInterval(async()=>{await fetchState();if(!S.free_optimizing&&!S.corridas_running){clearInterval(pollInt);pollInt=null;}},700);
+  pollInt=setInterval(async()=>{await fetchState();if(!S.corridas_running){clearInterval(pollInt);pollInt=null;}},700);
 }
 window.addEventListener('load',async()=>{
-  charts.libre=mkChart('cvs-libre');charts.compare=mkChart('cvs-compare');
   await fetchState();startPoll();
 });
-window.addEventListener('resize',()=>{charts.libre&&charts.libre.resize();charts.compare&&charts.compare.resize();});
+window.addEventListener('resize',()=>{charts.compare&&charts.compare.resize();});
 </script>
 </body>
 </html>
@@ -1161,12 +1085,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed=urllib.parse.urlparse(self.path)
         params=urllib.parse.parse_qs(parsed.query)
-        if parsed.path=="/api/run_free":
-            STATE.run_free(int(params.get("corrida",["1"])[0]));self.send_json({"ok":True})
-        elif parsed.path=="/api/run_corridas":
-            STATE.run_all_corridas();self.send_json({"ok":True})
+        if parsed.path=="/api/run_corridas":
+            use_random = params.get("random",["0"])[0] == "1"
+            STATE.run_all_corridas(use_random_seed=use_random);self.send_json({"ok":True})
         elif parsed.path=="/api/reset_corridas":
             STATE.reset_corridas();self.send_json({"ok":True})
+        elif parsed.path=="/api/select_corrida":
+            STATE.select_corrida(int(params.get("num",["0"])[0]));self.send_json({"ok":True})
         else:self.send_response(404);self.end_headers()
 
 
@@ -1179,8 +1104,8 @@ def main():
     print(f"  Grupo 6 · Sistemas Inteligentes 2026-I · UNMSM")
     print(f"{'='*62}")
     print(f"  URL : {url}")
-    print(f"  Instancia : Tabla 2 (N=30, M=8, B=S/50 000)")
-    print(f"  Preferencias: sobre ESTABLECIMIENTOS (IDs 1-8) — §2.1 §3.1")
+    print(f"  Instancia : N=30, M=8, B=S/50 000")
+    print(f"  Preferencias: sobre ESTABLECIMIENTOS (IDs 1-8)")
     print(f"  Ctrl+C para detener.")
     print(f"{'='*62}\n")
     threading.Timer(0.8,lambda:webbrowser.open(url)).start()
